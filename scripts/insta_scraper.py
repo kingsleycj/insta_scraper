@@ -36,17 +36,37 @@ def extract_email(text):
 def scrape_hashtag_posts(page, tag, scrolls=10):
     print(f"Scraping posts for #{tag}...")
     page.goto(f"https://www.instagram.com/explore/tags/{tag}/")
-    page.wait_for_selector("article a[href*='/p/']", timeout=15000)  # Wait for posts to load
+    time.sleep(5)
+    print("Page title:", page.title())  # Debug: What page are we actually on?
 
+    # Dismiss any cookies or dialogs
+    try:
+        page.click("button:has-text('Accept')", timeout=5000)
+    except:
+        pass
+    try:
+        page.click("button:has-text('Not Now')", timeout=5000)
+    except:
+        pass
+
+    # Wait for the main content container
+    try:
+        page.wait_for_selector("main", timeout=20000)
+    except:
+        print(f"Could not load hashtag: {tag}")
+        return set()
+
+    # Collect post links
     post_links = set()
-    for _ in range(scrolls):  # Scroll multiple times to load more
-        page.mouse.wheel(0, 3000)
-        time.sleep(2)
-        links = page.query_selector_all("article a[href*='/p/']")
+    for _ in range(scrolls):
+        links = page.query_selector_all("a[href*='/p/']")
         for link in links:
             href = link.get_attribute("href")
             if href and href.startswith("/p/"):
                 post_links.add(href)
+        page.mouse.wheel(0, 3000)
+        time.sleep(2)
+
     return post_links
 
 # ==============================
