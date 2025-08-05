@@ -143,6 +143,7 @@ def scrape_instagram_profiles():
     # ==============================
     # 7. Save to Google Sheets
     # ==============================
+    
     df = pd.DataFrame(data, columns=["Username", "Profile URL", "Bio", "Followers", "Following", "Posts", "Email"])
     sheet.clear()
     sheet.append_row(df.columns.tolist())  # Add headers
