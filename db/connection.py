@@ -1,7 +1,17 @@
-from mongoengine import connect
+# db/connection.py
 import os
+from mongoengine import connect
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB")
 
 def init_db():
-    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/instagram_scraper")
-    connect(host=mongo_uri)
-    print(f"Connected to MongoDB at {mongo_uri}")
+    connect(
+        db=MONGO_DB,
+        host=MONGO_URI,
+        alias="default"
+    )
+    print(f"Connected to MongoDB at {MONGO_URI}, database: {MONGO_DB}")

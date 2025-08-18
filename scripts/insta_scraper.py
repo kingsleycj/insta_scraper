@@ -1,124 +1,110 @@
 import os
-import requests
-import datetime
-from pymongo import MongoClient
+import time
+import pandas as pd
 from dotenv import load_dotenv
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from instagrapi import Client
 from db.connection import init_db
 from db.models import InstagramProfile
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Initialize DB
-init_db()
-
+# -------------------------------
 # Load environment variables
+# -------------------------------
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB = os.getenv("MONGO_DB")
-SESSION_ID = os.getenv("INSTAGRAM_SESSION_ID")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+# Google Sheets setup
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
+CLIENT = gspread.authorize(CREDS)
 
-# Setup MongoDB
-client = MongoClient(MONGO_URI)
-db = client[MONGO_DB]
-profiles = db["profiles"]
+# MongoDB init
+init_db()
 
-# Setup Google Sheets
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("google_service.json", scope)
-gs_client = gspread.authorize(creds)
-sheet = gs_client.open_by_key(GOOGLE_SHEET_ID).sheet1
+# Instagram client
+cl = Client()
+cl.load_settings("insta_session.json")
 
-# Instagram headers
-headers = {
-    "User-Agent": "Mozilla/5.0",
-    "Cookie": f"sessionid={SESSION_ID};"
-}
+try:
+    cl.get_timeline_feed()  # test if session works
+except Exception:
+    print("⚠️ Session expired. Login again with credentials.")
+    USERNAME = os.getenv("INSTA_USERNAME")
+    PASSWORD = os.getenv("INSTA_PASSWORD")
+    cl.login(USERNAME, PASSWORD)
+    cl.dump_settings("insta_session.json")
 
-def fetch_hashtag_posts(hashtag, limit=20):
-    """Fetch posts from a hashtag JSON endpoint"""
-    url = f"https://www.instagram.com/explore/tags/{hashtag}/?__a=1&__d=dis"
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        print(f"Failed to fetch {hashtag}: {r.status_code}")
-        return []
-    
-    try:
-        data = r.json()
-        edges = data["graphql"]["hashtag"]["edge_hashtag_to_media"]["edges"]
-        posts = [edge["node"]["owner"]["id"] for edge in edges[:limit]]
-        return posts
-    except Exception as e:
-        print("Error parsing hashtag JSON:", e)
-        return []
+# -------------------------------
+# Scraping logic
+# -------------------------------
+def scrape_profiles(usernames):
+    data = []
+    for username in usernames:
+        try:
+            user = cl.user_info_by_username(username)
+            profile = {
+                "username": user.username,
+                "profile_url": f"https://instagram.com/{user.username}",
+                "bio": user.biography,
+                "followers": user.follower_count,
+                "following": user.following_count,
+                "posts": user.media_count,
+                "email": user.public_email if user.public_email else ""
+            }
 
-def fetch_profile(username):
-    """Fetch Instagram profile info via JSON"""
-    url = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        print(f"Failed to fetch profile {username}")
-        return None
+            # Save to MongoDB
+            if not InstagramProfile.objects(username=user.username):
+                InstagramProfile(**profile).save()
+            else:
+                print(f"⚠️ Skipping duplicate: {user.username}")
 
-    try:
-        data = r.json()["graphql"]["user"]
-        profile = {
-            "username": data["username"],
-            "full_name": data.get("full_name", ""),
-            "bio": data.get("biography", ""),
-            "followers": data["edge_followed_by"]["count"],
-            "following": data["edge_follow"]["count"],
-            "posts_count": data["edge_owner_to_timeline_media"]["count"],
-            "email": data.get("business_email", ""),
-            "profile_pic": data.get("profile_pic_url_hd", ""),
-            "last_scraped": datetime.datetime.utcnow()
-        }
-        return profile
-    except Exception as e:
-        print("Error parsing profile JSON:", e)
-        return None
+            data.append(profile)
+            time.sleep(2)  # avoid Instagram ban
+        except Exception as e:
+            print(f"❌ Error scraping {username}: {e}")
+    return data
 
-def save_to_mongo(profile):
-    """Insert or update profile in MongoDB"""
-    if not profile:
-        return
-    profiles.update_one(
-        {"username": profile["username"]},
-        {"$set": profile},
-        upsert=True
-    )
-
-def export_to_sheets():
-    """Export MongoDB data to Google Sheets"""
-    all_profiles = list(profiles.find())
-    rows = [["Username", "Full Name", "Bio", "Followers", "Following", "Posts", "Email", "Profile Pic"]]
-    for p in all_profiles:
-        rows.append([
-            p["username"], p["full_name"], p["bio"], p["followers"], 
-            p["following"], p["posts_count"], p["email"], p["profile_pic"]
-        ])
-    sheet.clear()
-    sheet.append_rows(rows)
-
-if __name__ == "__main__":
-    hashtags = ["nigerianfood", "naijafoodie", "nigerianchef", "lagosfoodie"]
-    scraped = set()
-
+# -------------------------------
+# Extract usernames from hashtags
+# -------------------------------
+def get_usernames_from_hashtags(hashtags, posts_per_hashtag=20):
+    usernames = set()
     for tag in hashtags:
-        print(f"Scraping #{tag}...")
-        user_ids = fetch_hashtag_posts(tag)
-        for uid in user_ids:
-            # Normally you'd need to map UID -> username (IG obfuscates this now)
-            # For now, placeholder usernames
-            username = f"user_{uid}"
-            if username not in scraped:
-                profile = fetch_profile(username)
-                if profile:
-                    save_to_mongo(profile)
-                scraped.add(username)
+        try:
+            medias = cl.hashtag_medias_recent(tag, amount=posts_per_hashtag)
+            for m in medias:
+                usernames.add(m.user.username)
+            print(f"✅ {len(medias)} posts fetched from #{tag}")
+            time.sleep(5)  # avoid rate limiting
+        except Exception as e:
+            print(f"❌ Error fetching from #{tag}: {e}")
+    return list(usernames)
 
-    export_to_sheets()
-    print("✅ Scraping complete. Data in MongoDB + Google Sheets.")
-# This script scrapes Instagram profiles based on hashtags, saves them to MongoDB, and exports the data to Google Sheets.
-# Make sure to set up your environment variables and Google Sheets API credentials before running.
+# -------------------------------
+# Save to Google Sheets
+# -------------------------------
+def save_to_google_sheets(data):
+    df = pd.DataFrame(data)
+    sheet = CLIENT.open_by_key(SHEET_ID).sheet1
+    sheet.clear()
+    sheet.update([df.columns.values.tolist()] + df.values.tolist())
+    print("✅ Data saved to Google Sheets!")
+
+# -------------------------------
+# MAIN
+# -------------------------------
+if __name__ == "__main__":
+    hashtags_to_search = ["nigerianfood", "lagosfoodie", "naijafood"]  # change as needed
+    usernames_to_scrape = get_usernames_from_hashtags(hashtags_to_search, posts_per_hashtag=10)
+
+    print(f"🔎 Found {len(usernames_to_scrape)} unique usernames.")
+
+    results = scrape_profiles(usernames_to_scrape)
+
+    if results:
+        save_to_google_sheets(results)
+        print("✅ Scraping complete. Data stored in MongoDB + Google Sheets.")
+    else:
+        print("⚠️ No data scraped.")
+

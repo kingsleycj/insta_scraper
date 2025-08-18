@@ -1,10 +1,13 @@
-from mongoengine import Document, StringField, IntField
+# db/models.py
+from mongoengine import Document, StringField, IntField, DateTimeField
 
 class InstagramProfile(Document):
     username = StringField(required=True, unique=True)
-    profile_url = StringField(required=True)
+    full_name = StringField()
     bio = StringField()
     followers = IntField()
     following = IntField()
-    posts = IntField()
+    posts_count = IntField()
     email = StringField()
+    profile_pic = StringField()
+    last_scraped = DateTimeField()
