@@ -1,110 +1,105 @@
+# scripts/insta_scraper.py
 import os
+import json
 import time
-import pandas as pd
 from dotenv import load_dotenv
-from instagrapi import Client
+from playwright.sync_api import sync_playwright
 from db.connection import init_db
 from db.models import InstagramProfile
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
-# -------------------------------
-# Load environment variables
-# -------------------------------
+# -----------------------------
+# Load Environment
+# -----------------------------
 load_dotenv()
 
-# Google Sheets setup
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", SCOPE)
-CLIENT = gspread.authorize(CREDS)
+SESSION_FILE = "session.json"
+TARGET_HASHTAG = ["naijafoodie, lagosfood, igbofood, africanfood, africanmeal, nigerianfood"]  # Example: scrape profiles from #foodie
+MAX_PROFILES = 1000        # target number of profiles
 
-# MongoDB init
-init_db()
+# -----------------------------
+# Session Management
+# -----------------------------
+def save_session(context):
+    storage = context.storage_state()
+    with open(SESSION_FILE, "w") as f:
+        json.dump(storage, f)
+    print("💾 Session saved successfully.")
 
-# Instagram client
-cl = Client()
-cl.load_settings("insta_session.json")
+def load_session_if_exists(context):
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE, "r") as f:
+            storage_state = json.load(f)
+        cookies = storage_state.get("cookies", [])
+        if isinstance(cookies, list):
+            context.add_cookies(cookies)
+            print("✅ Session loaded successfully (cookies added).")
+            return True
+    return False
 
-try:
-    cl.get_timeline_feed()  # test if session works
-except Exception:
-    print("⚠️ Session expired. Login again with credentials.")
-    USERNAME = os.getenv("INSTA_USERNAME")
-    PASSWORD = os.getenv("INSTA_PASSWORD")
-    cl.login(USERNAME, PASSWORD)
-    cl.dump_settings("insta_session.json")
+# -----------------------------
+# Instagram Scraper
+# -----------------------------
+def login_instagram(page):
+    print("🌍 Opening Instagram login page...")
+    page.goto("https://www.instagram.com/accounts/login/", timeout=60000)
 
-# -------------------------------
-# Scraping logic
-# -------------------------------
-def scrape_profiles(usernames):
-    data = []
-    for username in usernames:
-        try:
-            user = cl.user_info_by_username(username)
-            profile = {
-                "username": user.username,
-                "profile_url": f"https://instagram.com/{user.username}",
-                "bio": user.biography,
-                "followers": user.follower_count,
-                "following": user.following_count,
-                "posts": user.media_count,
-                "email": user.public_email if user.public_email else ""
-            }
+    print("🔑 Please log in manually within 60 seconds...")
+    page.wait_for_timeout(60000)
+    print("⏳ Login time finished, continuing...")
 
-            # Save to MongoDB
-            if not InstagramProfile.objects(username=user.username):
-                InstagramProfile(**profile).save()
-            else:
-                print(f"⚠️ Skipping duplicate: {user.username}")
+def scrape_instagram_profiles():
+    print("🚀 Starting Instagram scraper...")
 
-            data.append(profile)
-            time.sleep(2)  # avoid Instagram ban
-        except Exception as e:
-            print(f"❌ Error scraping {username}: {e}")
-    return data
+    # Init DB
+    init_db()
 
-# -------------------------------
-# Extract usernames from hashtags
-# -------------------------------
-def get_usernames_from_hashtags(hashtags, posts_per_hashtag=20):
-    usernames = set()
-    for tag in hashtags:
-        try:
-            medias = cl.hashtag_medias_recent(tag, amount=posts_per_hashtag)
-            for m in medias:
-                usernames.add(m.user.username)
-            print(f"✅ {len(medias)} posts fetched from #{tag}")
-            time.sleep(5)  # avoid rate limiting
-        except Exception as e:
-            print(f"❌ Error fetching from #{tag}: {e}")
-    return list(usernames)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
 
-# -------------------------------
-# Save to Google Sheets
-# -------------------------------
-def save_to_google_sheets(data):
-    df = pd.DataFrame(data)
-    sheet = CLIENT.open_by_key(SHEET_ID).sheet1
-    sheet.clear()
-    sheet.update([df.columns.values.tolist()] + df.values.tolist())
-    print("✅ Data saved to Google Sheets!")
+        # Load or login session
+        if not load_session_if_exists(context):
+            page = context.new_page()
+            login_instagram(page)
+            save_session(context)
+        else:
+            page = context.new_page()
+            page.goto("https://www.instagram.com/", timeout=120000)
 
-# -------------------------------
-# MAIN
-# -------------------------------
+        # Go to hashtag page
+        hashtag_url = f"https://www.instagram.com/explore/tags/{TARGET_HASHTAG}/"
+        print(f"📌 Navigating to hashtag page: {hashtag_url}")
+        page.goto(hashtag_url, timeout=60000)
+
+        scraped_profiles = set()
+        while len(scraped_profiles) < MAX_PROFILES:
+            # Extract profile links from visible posts
+            links = page.locator("a").all()
+            for link in links:
+                href = link.get_attribute("href")
+                if href and href.startswith("/") and len(href.split("/")) == 3:  # e.g. /username/
+                    username = href.strip("/")
+                    if username not in scraped_profiles:
+                        scraped_profiles.add(username)
+                        print(f"📸 Found profile: {username}")
+
+                        # Save in DB
+                        InstagramProfile(
+                            username=username
+                        ).save()
+
+                        if len(scraped_profiles) >= MAX_PROFILES:
+                            break
+
+            # Scroll to load more
+            page.mouse.wheel(0, 2000)
+            time.sleep(2)
+
+        browser.close()
+        print(f"✅ Finished scraping {len(scraped_profiles)} profiles!")
+
+# -----------------------------
+# Run Script
+# -----------------------------
 if __name__ == "__main__":
-    hashtags_to_search = ["nigerianfood", "lagosfoodie", "naijafood"]  # change as needed
-    usernames_to_scrape = get_usernames_from_hashtags(hashtags_to_search, posts_per_hashtag=10)
-
-    print(f"🔎 Found {len(usernames_to_scrape)} unique usernames.")
-
-    results = scrape_profiles(usernames_to_scrape)
-
-    if results:
-        save_to_google_sheets(results)
-        print("✅ Scraping complete. Data stored in MongoDB + Google Sheets.")
-    else:
-        print("⚠️ No data scraped.")
-
+    scrape_instagram_profiles()

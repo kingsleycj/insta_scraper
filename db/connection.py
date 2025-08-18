@@ -14,4 +14,4 @@ def init_db():
         host=MONGO_URI,
         alias="default"
     )
-    print(f"Connected to MongoDB at {MONGO_URI}, database: {MONGO_DB}")
+    print(f"Connected to MongoDB database: {MONGO_DB}")

@@ -3,3 +3,5 @@
 .venv/*
 credentials.json
 insta_session.json
+session.json
+__pycache__
